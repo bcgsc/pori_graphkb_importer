@@ -1,6 +1,6 @@
 const { loadDelimToJson } = require('../util');
 const {
-    rid, generateCacheKey, convertRecordToQueryFilters,
+    rid, convertRecordToQueryFilters, orderPreferredOntologyTerms,
 } = require('../graphkb');
 const { logger } = require('../logging');
 
@@ -195,7 +195,7 @@ const cleanRawRow = (rawRow) => {
  * @param {string} opt.filename the path to the input OWL file
  * @param {ApiRequst} opt.conn the API connection object
  */
-const uploadFile = async ({ filename, conn }) => {
+const uploadFile = async ({ filename, conn, ignoreCache = false }) => {
     logger.info('Loading external NCIT data');
     logger.info(`loading: ${filename}`);
     const rawRows = await loadDelimToJson(filename, {
@@ -231,6 +231,7 @@ const uploadFile = async ({ filename, conn }) => {
             .join('|');
     }
     const deprecatedRows = [];
+    const erroredSourceIds = new Set();
 
     for (const raw of rawRows) {
         try {
@@ -252,6 +253,7 @@ const uploadFile = async ({ filename, conn }) => {
                 errors[err] = err;
                 logger.error(err);
             }
+            erroredSourceIds.add(raw.id.toLowerCase());
 
             counts.skip++;
         }
@@ -289,7 +291,7 @@ const uploadFile = async ({ filename, conn }) => {
         fetchConditions: { name: SOURCE_DEFN.name },
         target: 'Source',
     }));
-    const recordsById = {};
+
     const subclassEdges = [];
 
     // list the ncit records already loaded
@@ -300,19 +302,22 @@ const uploadFile = async ({ filename, conn }) => {
         neighbors: 0,
         target: 'Ontology',
     });
+    cachedRecords.sort(orderPreferredOntologyTerms);
+    cachedRecords.reverse();
     const exists = new Set();
     const existsHashCheck = record => [
-        generateCacheKey(record),
-        record.name,
+        record.sourceId.toLowerCase(),
+        record.name.toLowerCase(),
         record.displayName,
     ].join('____');
 
     for (const record of cachedRecords) {
-        cached[generateCacheKey(record)] = record;
+        cached[record.sourceId] = record;
         exists.add(existsHashCheck(record));
     }
     logger.info(`loaded and cached ${Object.keys(cached).length} records`);
 
+    const recordsById = {};
 
     for (let i = 0; i < rows.length; i++) {
         const row = rows[i];
@@ -325,12 +330,15 @@ const uploadFile = async ({ filename, conn }) => {
         let record;
 
         try {
-            const cacheKey = generateCacheKey(row);
-
-            if (recordsById[cacheKey]) {
-                throw new Error(`code is not unique (${cacheKey})`);
+            if (recordsById[row.sourceId]) {
+                throw new Error(`code is not unique (${row.sourceId})`);
             }
-            if (exists.has(existsHashCheck(row))) {
+            recordsById[row.sourceId] = row;
+
+            // add the parents
+            subclassEdges.push(...row.parents.map(parent => [row.sourceId, parent]));
+
+            if (exists.has(existsHashCheck(row)) && !ignoreCache) {
                 counts.exists++;
                 continue;
             }
@@ -357,8 +365,11 @@ const uploadFile = async ({ filename, conn }) => {
                 }),
                 target: endpoint,
                 upsert: true,
+                upsertCheckExclude: [
+                    'comment',
+                ],
             });
-            cached[generateCacheKey(record)] = record;
+            cached[record.sourceId] = record;
 
             // add the synonyms
             for (const synonym of row.synonyms) {
@@ -386,7 +397,6 @@ const uploadFile = async ({ filename, conn }) => {
                         upsert: true,
                         upsertCheckExclude: [
                             'comment',
-                            'displayName',
                         ],
                     });
 
@@ -404,31 +414,37 @@ const uploadFile = async ({ filename, conn }) => {
                 }
             }
 
-
-            // add the parents
-            subclassEdges.push(row.parents.map(parent => [cacheKey, generateCacheKey({ sourceId: parent })]));
             counts.success++;
         } catch (err) {
             logger.error(err);
+            erroredSourceIds.add(row.sourceId);
             counts.error++;
         }
     }
 
     // now create all the subclass relationships
-    for (const [recordKey, parentKey] of subclassEdges) {
-        if (cached[recordKey] && cached[parentKey]) {
+    for (const [childSourceId, parentSourceId] of subclassEdges) {
+        if (cached[childSourceId] && cached[parentSourceId]) {
             await conn.addRecord({
                 content: {
-                    in: rid(cached[parentKey]),
-                    out: rid(cached[recordKey]),
+                    in: rid(cached[parentSourceId]),
+                    out: rid(cached[childSourceId]),
                     source,
                 },
                 existsOk: true,
                 fetchExisting: false,
                 target: 'SubClassOf',
             });
+        } else if (!(
+            erroredSourceIds.has(childSourceId)
+            || erroredSourceIds.has(parentSourceId)
+            || rejected.has(parentSourceId)
+            || rejected.has(childSourceId)
+        )) {
+            logger.warn(`one or more records in relationship not loaded: ${childSourceId}, ${parentSourceId}`);
         }
     }
+
     logger.info(JSON.stringify(counts));
 };
 

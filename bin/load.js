@@ -86,6 +86,11 @@ fileParser.add_argument('input', {
     help: 'path to the file/dir to be loaded',
     type: fileExists,
 });
+fileParser.add_argument('--ignoreCache', {
+    action: 'store_true',
+    default: false,
+    help: 'Load the full content, to not check for previously loaded records already in the GraphKB instance',
+});
 
 const civicParser = subparsers.add_parser('civic');
 civicParser.add_argument('--trustedCurators', {
